@@ -215,6 +215,14 @@ io.on("connection", (socket) => {
     if (partner) io.to(partner).emit("reaction", { emoji });
   });
 
+  // ── Profile sharing
+  socket.on("share_profile", ({ roomId, profile }) => {
+    const room = activeRooms.get(roomId);
+    if (!room) return;
+    const partner = room.users.find((id) => id !== socket.id);
+    if (partner) io.to(partner).emit("partner_profile", profile);
+  });
+
   // ── Skip / Next ───────────────────────────────────────────────────────────────
   socket.on("next_stranger", () => {
     leaveRoom(socket.id);
