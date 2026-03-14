@@ -8,7 +8,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: "*", // In production: replace with your Netlify URL
+    origin: ["https://zapchatapp.netlify.app", "http://localhost:3000"],
     methods: ["GET", "POST"],
   },
 });
