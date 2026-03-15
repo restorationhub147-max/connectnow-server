@@ -8,13 +8,16 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: ["https://zapchatapp.netlify.app", "http://localhost:3000"],
+    origin: ["https://zapchatapp.netlify.app", "http://localhost:3000", "http://127.0.0.1:5500"],
     methods: ["GET", "POST"],
   },
+  pingTimeout: 60000,
+  pingInterval: 25000,
+  transports: ["websocket", "polling"],
 });
 
 app.use(cors());
-app.get("/", (req, res) => res.send("ConnectNow Server Running ✅"));
+app.get("/", (req, res) => res.send("ZapChat Server Running ✅"));
 app.get("/stats", (req, res) => {
   res.json({
     online: waitingUsers.length + activeRooms.size * 2,
@@ -23,59 +26,37 @@ app.get("/stats", (req, res) => {
   });
 });
 
-// ─── State ────────────────────────────────────────────────────────────────────
-
-// waitingUsers: array of { socketId, interests[], country, language, gender }
+// ─── State ───────────────────────────────────────────────────────────────────
 let waitingUsers = [];
-
-// activeRooms: Map<roomId, { users: [socketIdA, socketIdB] }>
-const activeRooms = new Map();
-
-// userRoom: Map<socketId, roomId>
-const userRoom = new Map();
+const activeRooms = new Map(); // roomId → { users: [socketIdA, socketIdB] }
+const userRoom = new Map();    // socketId → roomId
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
 function generateRoomId() {
   return Math.random().toString(36).substring(2, 10);
 }
 
-// Score how well two users match (higher = better)
 function matchScore(a, b) {
   let score = 0;
-  // Shared interests — each match +10
   if (a.interests && b.interests) {
     const shared = a.interests.filter((i) => b.interests.includes(i));
     score += shared.length * 10;
   }
-  // Same country +5
   if (a.country && b.country && a.country === b.country) score += 5;
-  // Same language +8
   if (a.language && b.language && a.language === b.language) score += 8;
-  // Gender preference +3
-  if (a.gender && b.gender && a.gender !== b.gender) score += 3;
   return score;
 }
 
-// Find best match for a user from the waiting pool
 function findBestMatch(user) {
   if (waitingUsers.length === 0) return null;
-
-  let bestIndex = -1;
-  let bestScore = -1;
-
+  let bestIndex = -1, bestScore = -1;
   for (let i = 0; i < waitingUsers.length; i++) {
-    const candidate = waitingUsers[i];
-    if (candidate.socketId === user.socketId) continue;
-    const score = matchScore(user, candidate);
-    if (score > bestScore) {
-      bestScore = score;
-      bestIndex = i;
-    }
+    const c = waitingUsers[i];
+    if (c.socketId === user.socketId) continue;
+    const s = matchScore(user, c);
+    if (s > bestScore) { bestScore = s; bestIndex = i; }
   }
-
-  if (bestIndex === -1) return null;
-  return { user: waitingUsers[bestIndex], index: bestIndex };
+  return bestIndex === -1 ? null : { user: waitingUsers[bestIndex], index: bestIndex };
 }
 
 function removeFromWaiting(socketId) {
@@ -85,10 +66,8 @@ function removeFromWaiting(socketId) {
 function leaveRoom(socketId) {
   const roomId = userRoom.get(socketId);
   if (!roomId) return;
-
   const room = activeRooms.get(roomId);
   if (room) {
-    // Notify the other user
     room.users.forEach((uid) => {
       if (uid !== socketId) {
         io.to(uid).emit("partner_left");
@@ -100,17 +79,17 @@ function leaveRoom(socketId) {
   userRoom.delete(socketId);
 }
 
+function getOnlineCount() {
+  return waitingUsers.length + activeRooms.size * 2;
+}
+
 // ─── Socket Events ────────────────────────────────────────────────────────────
-
 io.on("connection", (socket) => {
-  console.log("User connected:", socket.id);
-
-  // Broadcast updated online count
-  io.emit("online_count", waitingUsers.length + activeRooms.size * 2 + 1);
+  console.log("Connected:", socket.id);
+  io.emit("online_count", getOnlineCount() + 1);
 
   // ── Find Match ──────────────────────────────────────────────────────────────
   socket.on("find_match", (data) => {
-    // data: { interests[], country, language, gender, mode }
     const user = {
       socketId: socket.id,
       interests: data.interests || [],
@@ -118,31 +97,30 @@ io.on("connection", (socket) => {
       language: data.language || "",
       gender: data.gender || "",
       mode: data.mode || "video",
+      mood: data.mood || "",
     };
 
-    // Don't double-add
     removeFromWaiting(socket.id);
+    // If already in a room, leave it first
+    leaveRoom(socket.id);
 
     const match = findBestMatch(user);
 
     if (match) {
-      // Remove matched user from waiting pool
       waitingUsers.splice(match.index, 1);
-
       const roomId = generateRoomId();
       const partner = match.user;
 
-      // Create room
       activeRooms.set(roomId, { users: [socket.id, partner.socketId] });
       userRoom.set(socket.id, roomId);
       userRoom.set(partner.socketId, roomId);
 
-      // Calculate shared interests
       const sharedInterests = user.interests.filter((i) =>
         partner.interests.includes(i)
       );
 
-      // Notify both users — one is "initiator" (makes WebRTC offer)
+      // IMPORTANT: isInitiator=true for the NEWER user (socket)
+      // The waiting user (partner) is the answerer
       socket.emit("match_found", {
         roomId,
         isInitiator: true,
@@ -159,32 +137,35 @@ io.on("connection", (socket) => {
         partnerCountry: user.country,
       });
 
-      console.log(
-        `Matched: ${socket.id} ↔ ${partner.socketId} | Room: ${roomId} | Shared: ${sharedInterests}`
-      );
+      io.emit("online_count", getOnlineCount());
+      console.log(`Matched: ${socket.id} ↔ ${partner.socketId} | Room: ${roomId}`);
     } else {
-      // No match yet — add to waiting pool
       waitingUsers.push(user);
       socket.emit("waiting", { position: waitingUsers.length });
-      console.log(`Waiting: ${socket.id} | Pool size: ${waitingUsers.length}`);
+      io.emit("online_count", getOnlineCount());
+      console.log(`Waiting: ${socket.id} | Pool: ${waitingUsers.length}`);
     }
   });
 
   // ── WebRTC Signaling ─────────────────────────────────────────────────────────
-  // Relay WebRTC offer/answer/ICE to the partner in the same room
-
   socket.on("webrtc_offer", ({ roomId, offer }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
     const partner = room.users.find((id) => id !== socket.id);
-    if (partner) io.to(partner).emit("webrtc_offer", { offer });
+    if (partner) {
+      io.to(partner).emit("webrtc_offer", { offer });
+      console.log(`Offer: ${socket.id} → ${partner}`);
+    }
   });
 
   socket.on("webrtc_answer", ({ roomId, answer }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
     const partner = room.users.find((id) => id !== socket.id);
-    if (partner) io.to(partner).emit("webrtc_answer", { answer });
+    if (partner) {
+      io.to(partner).emit("webrtc_answer", { answer });
+      console.log(`Answer: ${socket.id} → ${partner}`);
+    }
   });
 
   socket.on("webrtc_ice", ({ roomId, candidate }) => {
@@ -194,20 +175,14 @@ io.on("connection", (socket) => {
     if (partner) io.to(partner).emit("webrtc_ice", { candidate });
   });
 
-  // ── Chat Messages ─────────────────────────────────────────────────────────────
+  // ── Chat / Typing / Reactions ────────────────────────────────────────────────
   socket.on("chat_message", ({ roomId, message }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
     const partner = room.users.find((id) => id !== socket.id);
-    if (partner) {
-      io.to(partner).emit("chat_message", {
-        message,
-        timestamp: Date.now(),
-      });
-    }
+    if (partner) io.to(partner).emit("chat_message", { message, timestamp: Date.now() });
   });
 
-  // ── Reactions ─────────────────────────────────────────────────────────────────
   socket.on("reaction", ({ roomId, emoji }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
@@ -215,7 +190,6 @@ io.on("connection", (socket) => {
     if (partner) io.to(partner).emit("reaction", { emoji });
   });
 
-  // ── Typing indicator relay
   socket.on("typing", ({ roomId, isTyping }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
@@ -223,7 +197,7 @@ io.on("connection", (socket) => {
     if (partner) io.to(partner).emit("typing", { isTyping });
   });
 
-  // ── Profile sharing
+  // ── Profile Share ─────────────────────────────────────────────────────────────
   socket.on("share_profile", ({ roomId, profile }) => {
     const room = activeRooms.get(roomId);
     if (!room) return;
@@ -231,22 +205,23 @@ io.on("connection", (socket) => {
     if (partner) io.to(partner).emit("partner_profile", profile);
   });
 
-  // ── Skip / Next ───────────────────────────────────────────────────────────────
+  // ── Next / Skip ────────────────────────────────────────────────────────────────
   socket.on("next_stranger", () => {
     leaveRoom(socket.id);
+    io.emit("online_count", getOnlineCount());
   });
 
-  // ── Disconnect ────────────────────────────────────────────────────────────────
-  socket.on("disconnect", () => {
-    console.log("User disconnected:", socket.id);
+  // ── Disconnect ─────────────────────────────────────────────────────────────────
+  socket.on("disconnect", (reason) => {
+    console.log("Disconnected:", socket.id, "reason:", reason);
     removeFromWaiting(socket.id);
     leaveRoom(socket.id);
-    io.emit("online_count", waitingUsers.length + activeRooms.size * 2);
+    io.emit("online_count", getOnlineCount());
   });
 });
 
-// ─── Start ────────────────────────────────────────────────────────────────────
+// ─── Start ───────────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3001;
 server.listen(PORT, () => {
-  console.log(`ConnectNow server running on port ${PORT}`);
+  console.log(`ZapChat server running on port ${PORT}`);
 });
